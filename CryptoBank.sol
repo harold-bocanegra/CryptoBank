@@ -2,6 +2,9 @@
 
 pragma solidity ^0.8.24;
 
+/// @notice Thrown when a function is called while the contract is paused.
+error ContractPaused();
+
 /// @notice Thrown when the requested amount is greater than the user balance.
 error InsufficientBalance(uint256 available, uint256 requested);
 
@@ -25,22 +28,26 @@ error ZeroAddress();
 /**
  * @title CryptoBank
  * @author Harold Bocanegra
- * @notice A simple smart contract that simulates a basic crypto bank where users can deposit and withdraw Ether.
+ * @notice A simple crypto bank that allows users to deposit and withdraw Ether while providing basic administrative controls.
  * @dev Uses the Checks-Effects-Interactions pattern to mitigate reentrancy attacks.
  */
 contract CryptoBank {
 
+    bool public paused;
     uint256 public maxUserBalance;
-    address public immutable admin;
+    address public admin;
 
     mapping(address => uint256) private _balances;
 
     event EtherDeposited(address indexed user, uint256 etherAmount);
     event EtherWithdrawn(address indexed user, uint256 etherAmount);
+    event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
+    event ContractWasPaused(address indexed admin);
+    event ContractWasUnpaused(address indexed admin);
 
     /**
      * @notice Restricts function execution to the contract admin.
-    */
+     */
     modifier onlyAdmin() {
         if (msg.sender != admin) {
             revert OnlyAdminAllowed();
@@ -49,6 +56,17 @@ contract CryptoBank {
     }
 
     /**
+     * @notice Restricts function execution when the contract is not paused.
+     */
+    modifier whenNotPaused() {
+        if (paused) {
+            revert ContractPaused();
+        }
+        _;
+    }
+
+    /**
+     * @notice Deploys the contract.
      * @param maxUserBalance_ Maximum Ether balance allowed per user.
      * @param admin_ Address that will manage the contract.
      */
@@ -62,9 +80,9 @@ contract CryptoBank {
 
     /**
      * @notice Deposits Ether into the user's account.
-     * @dev Increases the user balance by msg.value
+     * @dev Increases the caller's balance by msg.value
      */
-    function depositEther() external payable {
+    function depositEther() external payable whenNotPaused {
         uint256 userBalance = _balances[msg.sender];
         uint256 newBalance = userBalance + msg.value;
         if (newBalance > maxUserBalance) {
@@ -78,7 +96,7 @@ contract CryptoBank {
      * @notice Withdraws Ether from the caller's account.
      * @param amount Amount of ETH to withdraw
      */
-    function withdrawEther(uint256 amount) external {
+    function withdrawEther(uint256 amount) external whenNotPaused {
 
         // Avoid Reentrancy attacks
         // CEI pattern: 1. Checks (validate balance)    2. Effects (update balance)    3. Interactions (transfer ether)
@@ -118,5 +136,53 @@ contract CryptoBank {
      */
     function balanceOf(address account) external view returns (uint256) {
         return _balances[account];
+    }
+
+    /**
+     * @notice Returns the Ether balance held by the contract.
+     * @return Current contract balance in wei.
+     */
+    function bankBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    /**
+     * @notice Transfers the admin role to a new account.
+     * @param newAdmin Address of the new admin.
+     */
+    function transferAdmin(address newAdmin) external onlyAdmin {
+        if (newAdmin == address(0)) {
+            revert ZeroAddress();
+        }
+
+        address previousAdmin = admin;
+
+        admin = newAdmin;
+
+        emit AdminTransferred(previousAdmin, newAdmin);
+    }
+
+    /**
+     * @notice Pauses the contract.
+     * @dev Can only be called by the contract admin.
+     */
+    function pause() external onlyAdmin {
+        if (!paused) {
+            paused = true;
+        }
+
+        emit ContractWasPaused(msg.sender);
+    }
+
+    /**
+     * @notice Unpauses the contract.
+     * @dev Can only be called by the contract admin.
+     */
+    function unpause() external onlyAdmin {
+        if (paused) {
+            paused = false;
+        }
+
+        emit ContractWasUnpaused(msg.sender);
     }
 }
