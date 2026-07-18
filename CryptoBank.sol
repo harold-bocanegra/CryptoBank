@@ -19,6 +19,9 @@ error MaxUserBalanceExceeded(
 /// @notice Thrown when a non-admin account calls an admin-only function.
 error OnlyAdminAllowed();
 
+/// @notice Thrown when a protected function is called reentrantly.
+error ReentrantCall();
+
 /// @notice Thrown when the Ether transfer to the caller fails.
 error TransferFailed();
 
@@ -37,6 +40,11 @@ contract CryptoBank {
     uint256 public maxUserBalance;
     address public admin;
 
+    uint256 private _unlocked = 1;
+    uint256 private _depositCount;
+    uint256 private _withdrawCount;
+    uint256 private _totalDeposited;
+    uint256 private _totalWithdrawn;
     mapping(address => uint256) private _balances;
 
     event EtherDeposited(address indexed user, uint256 etherAmount);
@@ -53,6 +61,21 @@ contract CryptoBank {
             revert OnlyAdminAllowed();
         }
         _;
+    }
+
+    /**
+     * @notice Prevents reentrant calls to a function.
+     */
+    modifier nonReentrant() {
+        if (_unlocked != 1) {
+            revert ReentrantCall();
+        }
+
+        _unlocked = 2;
+
+        _;
+
+        _unlocked = 1;
     }
 
     /**
@@ -88,15 +111,21 @@ contract CryptoBank {
         if (newBalance > maxUserBalance) {
             revert MaxUserBalanceExceeded(msg.sender, userBalance, msg.value, maxUserBalance);
         }
+
         _balances[msg.sender] = newBalance;
+
+        _totalDeposited += msg.value;
+        _depositCount++;
+
         emit EtherDeposited(msg.sender, msg.value);
     }
 
     /**
      * @notice Withdraws Ether from the caller's account.
      * @param amount Amount of ETH to withdraw
+     * @dev Uses the Checks-Effects-Interactions pattern and a reentrancy guard to mitigate reentrancy attacks.
      */
-    function withdrawEther(uint256 amount) external whenNotPaused {
+    function withdrawEther(uint256 amount) external whenNotPaused nonReentrant {
 
         // Avoid Reentrancy attacks
         // CEI pattern: 1. Checks (validate balance)    2. Effects (update balance)    3. Interactions (transfer ether)
@@ -111,6 +140,9 @@ contract CryptoBank {
         unchecked {
             _balances[msg.sender] = userBalance - amount;
         }
+
+         _totalWithdrawn += amount;
+         _withdrawCount++;
 
         // Transfer Ether
         (bool success,) = msg.sender.call{value: amount}("");
@@ -184,5 +216,37 @@ contract CryptoBank {
         }
 
         emit ContractWasUnpaused(msg.sender);
+    }
+
+    /**
+     * @notice Returns the total amount of Ether deposited into the contract.
+     * @return Total deposited amount in wei.
+     */
+    function totalDeposited() external view returns (uint256) {
+        return _totalDeposited;
+    }
+
+    /**
+     * @notice Returns the total amount of Ether withdrawn from the contract.
+     * @return Total withdrawn amount in wei.
+     */
+    function totalWithdrawn() external view returns (uint256) {
+        return _totalWithdrawn;
+    }
+
+    /**
+     * @notice Returns the total number of deposits made into the contract.
+     * @return Number of deposits.
+     */
+    function depositCount() external view returns (uint256) {
+        return _depositCount;
+    }
+
+    /**
+     * @notice Returns the total number of withdrawals made from the contract.
+     * @return Number of withdrawals.
+     */
+    function withdrawCount() external view returns (uint256) {
+        return _withdrawCount;
     }
 }
