@@ -5,8 +5,14 @@ pragma solidity ^0.8.24;
 /// @notice Thrown when a function is called while the contract is paused.
 error ContractPaused();
 
+/// @notice Thrown when a withdrawal exceeds the user's daily withdrawal limit.
+error DailyWithdrawalLimitExceeded(uint256 currentAmount, uint256 requestedAmount, uint256 dailyWithdrawalLimit);
+
 /// @notice Thrown when the requested amount is greater than the user balance.
 error InsufficientBalance(uint256 available, uint256 requested);
+
+/// @notice Thrown when a transaction index does not exist for an account.
+error InvalidTransactionIndex();
 
 /// @notice Thrown when an account exceeds the maximum allowed balance.
 error MaxUserBalanceExceeded(
@@ -36,22 +42,53 @@ error ZeroAddress();
  */
 contract CryptoBank {
 
+    struct DailyWithdrawalInfo {
+        uint256 day;
+        uint256 amount;
+    }
+
+    struct Transaction {
+        uint256 amount;
+        uint256 fee;
+        uint256 timestamp;
+        bool isDeposit;
+    }
+
     bool public paused;
     uint256 public maxUserBalance;
+    uint256 public dailyWithdrawalLimit;
     address public admin;
 
-    uint256 private _unlocked = 1;
     uint256 private _depositCount;
-    uint256 private _withdrawCount;
+    uint256 private _feesCharged;
     uint256 private _totalDeposited;
     uint256 private _totalWithdrawn;
+    uint256 private _unlocked = 1;
+    uint256 private _withdrawCount;
     mapping(address => uint256) private _balances;
+    mapping(address => DailyWithdrawalInfo) private _dailyWithdrawals;
+    mapping(address => Transaction[]) private _history;
 
+    /// @notice Emitted when a user deposits Ether.
     event EtherDeposited(address indexed user, uint256 etherAmount);
+
+    /// @notice Emitted when a user withdraws Ether.
     event EtherWithdrawn(address indexed user, uint256 etherAmount);
+
+    /// @notice Emitted when the admin role is transferred.
     event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
+
+    /// @notice Emitted when the contract is paused.
     event ContractWasPaused(address indexed admin);
+
+    /// @notice Emitted when the contract is unpaused.
     event ContractWasUnpaused(address indexed admin);
+
+    /// @notice Emitted when the daily withdrawal limit is configured.
+    event DailyWithdrawalLimitSet(uint256 limit);
+
+    /// @notice Emitted when the daily withdrawal limit is updated.
+    event DailyWithdrawalLimitUpdated(uint256 newLimit);
 
     /**
      * @notice Restricts function execution to the contract admin.
@@ -89,16 +126,40 @@ contract CryptoBank {
     }
 
     /**
+     * @notice Restricts withdrawals when the daily limit is exceeded.
+     * @param amount Amount of Ether to withdraw.
+     */
+    modifier withinDailyWithdrawalLimit(uint256 amount) {
+        uint256 currentDay = block.timestamp / 1 days;
+        DailyWithdrawalInfo storage info = _dailyWithdrawals[msg.sender];
+        if (info.day != currentDay) {
+            info.day = currentDay;
+            info.amount = 0;
+        }
+        if (info.amount + amount > dailyWithdrawalLimit) {
+            revert DailyWithdrawalLimitExceeded(info.amount, amount, dailyWithdrawalLimit);
+        }
+
+        info.amount += amount;
+
+        _;
+    }
+
+    /**
      * @notice Deploys the contract.
      * @param maxUserBalance_ Maximum Ether balance allowed per user.
+     * @param dailyWithdrawalLimit_ Maximum Ether amount that a user can withdraw per day.
      * @param admin_ Address that will manage the contract.
      */
-    constructor(uint256 maxUserBalance_, address admin_) {
+    constructor(uint256 maxUserBalance_, uint256 dailyWithdrawalLimit_, address admin_) {
         if (admin_ == address(0)) {
             revert ZeroAddress();
         }
         maxUserBalance = maxUserBalance_;
+        dailyWithdrawalLimit = dailyWithdrawalLimit_;
         admin = admin_;
+
+        emit DailyWithdrawalLimitUpdated(dailyWithdrawalLimit_);
     }
 
     /**
@@ -117,6 +178,15 @@ contract CryptoBank {
         _totalDeposited += msg.value;
         _depositCount++;
 
+        _history[msg.sender].push(
+            Transaction({
+                amount: msg.value,
+                fee: 0,
+                timestamp: block.timestamp,
+                isDeposit: true
+            })
+        );
+
         emit EtherDeposited(msg.sender, msg.value);
     }
 
@@ -125,7 +195,7 @@ contract CryptoBank {
      * @param amount Amount of ETH to withdraw
      * @dev Uses the Checks-Effects-Interactions pattern and a reentrancy guard to mitigate reentrancy attacks.
      */
-    function withdrawEther(uint256 amount) external whenNotPaused nonReentrant {
+    function withdrawEther(uint256 amount) external whenNotPaused nonReentrant withinDailyWithdrawalLimit(amount) {
 
         // Avoid Reentrancy attacks
         // CEI pattern: 1. Checks (validate balance)    2. Effects (update balance)    3. Interactions (transfer ether)
@@ -136,19 +206,32 @@ contract CryptoBank {
             revert InsufficientBalance(userBalance, amount);
         }
         
+        uint256 fee = amount / 100;
+        uint256 amountToTransfer = amount - fee;
+
         // Update balance
         unchecked {
             _balances[msg.sender] = userBalance - amount;
         }
 
-         _totalWithdrawn += amount;
-         _withdrawCount++;
+        _feesCharged += fee;
+        _totalWithdrawn += amount;
+        _withdrawCount++;
 
         // Transfer Ether
-        (bool success,) = msg.sender.call{value: amount}("");
+        (bool success,) = msg.sender.call{value: amountToTransfer}("");
         if (!success) {
             revert TransferFailed();
         }
+
+        _history[msg.sender].push(
+            Transaction({
+                amount: amount,
+                fee: fee,
+                timestamp: block.timestamp,
+                isDeposit: false
+            })
+        );
 
         emit EtherWithdrawn(msg.sender, amount);
     }
@@ -248,5 +331,63 @@ contract CryptoBank {
      */
     function withdrawCount() external view returns (uint256) {
         return _withdrawCount;
+    }
+
+    /**
+     * @notice Updates the daily withdrawal limit.
+     * @dev Can only be called by the contract admin.
+     * @param newLimit New daily withdrawal limit in wei.
+     */
+    function setDailyWithdrawalLimit(uint256 newLimit) external onlyAdmin {
+        dailyWithdrawalLimit = newLimit;
+
+        emit DailyWithdrawalLimitUpdated(newLimit);
+    }
+
+    /**
+     * @notice Returns the number of transactions made by an account.
+     * @param account Address to query.
+     * @return Number of transactions.
+     */
+    function transactionCount(address account) external view returns (uint256) {
+        return _history[account].length;
+    }
+
+    /**
+     * @notice Returns a transaction from an account history.
+     * @param account Address to query.
+     * @param index Transaction index in the account history.
+     * @return amount Transaction amount in wei.
+     * @return fee Fee charged for the transaction in wei.
+     * @return timestamp Transaction timestamp.
+     * @return isDeposit True if the transaction is a deposit, false if it is a withdrawal.
+     */
+    function transactionAt(address account, uint256 index) external view
+    returns (
+        uint256 amount,
+        uint256 fee,
+        uint256 timestamp,
+        bool isDeposit
+    ) {
+        if (index >= _history[account].length) {
+            revert InvalidTransactionIndex();
+        }
+
+        Transaction storage txInfo = _history[account][index];
+
+        return (
+            txInfo.amount,
+            txInfo.fee,
+            txInfo.timestamp,
+            txInfo.isDeposit
+        );
+    }
+
+    /**
+     * @notice Returns the total fees collected by the contract.
+     * @return Total fees charged in wei.
+     */
+    function totalFeesCharged() external view returns (uint256) {
+        return _feesCharged;
     }
 }
